@@ -1,0 +1,173 @@
+---
+# ─── ARGOCD PROJECT ───────────────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: demo-app
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: "Demo application project — GitOps managed"
+
+  sourceRepos:
+    - "https://github.com/thomasasamba-bot/05-devsecops-pipeline"
+
+  destinations:
+    - namespace: app
+      server:    https://kubernetes.default.svc
+    - namespace: app-staging
+      server:    https://kubernetes.default.svc
+    - namespace: app-dev
+      server:    https://kubernetes.default.svc
+
+  clusterResourceWhitelist:
+    - group: ""
+      kind:  Namespace
+    - group: rbac.authorization.k8s.io
+      kind:  ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind:  ClusterRoleBinding
+
+  namespaceResourceWhitelist:
+    - group: "apps"
+      kind:  Deployment
+    - group: ""
+      kind:  Service
+    - group: ""
+      kind:  ConfigMap
+    - group: autoscaling
+      kind:  HorizontalPodAutoscaler
+    - group: policy
+      kind:  PodDisruptionBudget
+    - group: networking.k8s.io
+      kind:  Ingress
+    - group: networking.k8s.io
+      kind:  NetworkPolicy
+
+  roles:
+    - name: developer
+      description: "Read-only access for developers"
+      policies:
+        - "p, proj:demo-app:developer, applications, get, demo-app/*, allow"
+        - "p, proj:demo-app:developer, applications, sync, demo-app/dev, allow"
+    - name: deployer
+      description: "Deploy access for CI/CD"
+      policies:
+        - "p, proj:demo-app:deployer, applications, *, demo-app/*, allow"
+
+---
+# ─── ARGOCD APPLICATION — DEV ─────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app-dev
+  namespace: argocd
+  labels:
+    environment: dev
+    app: demo-app
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  annotations:
+    notifications.argoproj.io/subscribe.on-deployed.slack:    deployments
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: deployments
+spec:
+  project: demo-app
+
+  source:
+    repoURL:        https://github.com/thomasasamba-bot/05-devsecops-pipeline
+    targetRevision: develop
+    path:           k8s/overlays/dev
+
+  destination:
+    server:    https://kubernetes.default.svc
+    namespace: app-dev
+
+  syncPolicy:
+    automated:
+      prune:    true    # Remove resources no longer in Git
+      selfHeal: true    # Revert manual changes — GitOps enforced
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+      - ApplyOutOfSyncOnly=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration:    5s
+        factor:      2
+        maxDuration: 3m
+
+  revisionHistoryLimit: 5
+
+---
+# ─── ARGOCD APPLICATION — STAGING ────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app-staging
+  namespace: argocd
+  labels:
+    environment: staging
+    app: demo-app
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: demo-app
+
+  source:
+    repoURL:        https://github.com/thomasasamba-bot/05-devsecops-pipeline
+    targetRevision: main
+    path:           k8s/overlays/staging
+
+  destination:
+    server:    https://kubernetes.default.svc
+    namespace: app-staging
+
+  syncPolicy:
+    automated:
+      prune:    true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+
+---
+# ─── ARGOCD APPLICATION — PRODUCTION ─────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app-prod
+  namespace: argocd
+  labels:
+    environment: prod
+    app: demo-app
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: demo-app
+
+  source:
+    repoURL:        https://github.com/thomasasamba-bot/05-devsecops-pipeline
+    targetRevision: main
+    path:           k8s/overlays/prod
+
+  destination:
+    server:    https://kubernetes.default.svc
+    namespace: app
+
+  syncPolicy:
+    # Production: manual sync only — no automated changes
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - PrunePropagationPolicy=foreground
+    retry:
+      limit: 3
+      backoff:
+        duration:    10s
+        factor:      2
+        maxDuration: 5m
+
+  revisionHistoryLimit: 10

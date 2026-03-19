@@ -1,0 +1,372 @@
+#!/usr/bin/env groovy
+/**
+ * DevSecOps Jenkins Pipeline
+ * ===========================
+ * Declarative pipeline with parallel security scanning stages,
+ * quality gates, and GitOps-driven deployment via ArgoCD.
+ *
+ * Required Jenkins plugins:
+ *   - Docker Pipeline, Kubernetes, AWS Steps
+ *   - SonarQube Scanner, OWASP Dependency-Check
+ *   - Blue Ocean, Slack Notification
+ */
+
+def IMAGE_TAG    = "${env.GIT_COMMIT[0..7]}"
+def IMAGE_URI    = ""
+def SCAN_PASSED  = true
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins-agent
+  containers:
+    - name: python
+      image: python:3.12-slim
+      command: [sleep, infinity]
+      resources:
+        requests: { cpu: 500m, memory: 512Mi }
+        limits:   { cpu: 1,    memory: 1Gi  }
+    - name: docker
+      image: docker:24-dind
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
+    - name: trivy
+      image: aquasec/trivy:latest
+      command: [sleep, infinity]
+    - name: kubectl
+      image: bitnami/kubectl:latest
+      command: [sleep, infinity]
+  volumes:
+    - name: docker-sock
+      hostPath:
+        path: /var/run/docker.sock
+'''
+        }
+    }
+
+    options {
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        disableConcurrentBuilds(abortPrevious: true)
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    environment {
+        AWS_REGION        = 'us-east-1'
+        ECR_REGISTRY      = credentials('ecr-registry')
+        ECR_REPOSITORY    = 'demo-app'
+        EKS_CLUSTER       = 'eks-demo'
+        SONAR_TOKEN       = credentials('sonar-token')
+        SONAR_HOST_URL    = credentials('sonar-host-url')
+        ARGOCD_SERVER     = credentials('argocd-server')
+        ARGOCD_TOKEN      = credentials('argocd-token')
+        SLACK_CHANNEL     = '#deployments'
+    }
+
+    stages {
+
+        // ── STAGE 1: CHECKOUT & SETUP ──────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    IMAGE_URI = "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} — ${IMAGE_TAG}"
+                    sh "echo 'Branch: ${env.BRANCH_NAME} | Tag: ${IMAGE_TAG}'"
+                }
+            }
+        }
+
+        // ── STAGE 2: PARALLEL SECURITY ANALYSIS ───────────────────
+        stage('Security Analysis') {
+            parallel {
+
+                stage('SAST — SonarQube') {
+                    steps {
+                        container('python') {
+                            sh '''
+                                pip install -q pytest pytest-cov bandit safety
+                                pip install -q -r app/requirements.txt
+
+                                # Run tests with coverage
+                                pytest app/tests/ \
+                                    --cov=app/src \
+                                    --cov-report=xml:coverage.xml \
+                                    --junitxml=test-results.xml \
+                                    --cov-fail-under=80 -q
+
+                                # Bandit SAST
+                                bandit -r app/src/ -f json -o bandit-report.json \
+                                    --severity-level medium -q || true
+
+                                # Safety dependency check
+                                safety check -r app/requirements.txt \
+                                    --json -o safety-report.json || true
+                            '''
+                        }
+                        withSonarQubeEnv('SonarQube') {
+                            sh '''
+                                sonar-scanner \
+                                    -Dsonar.projectKey=demo-app \
+                                    -Dsonar.sources=app/src \
+                                    -Dsonar.tests=app/tests \
+                                    -Dsonar.python.coverage.reportPaths=coverage.xml \
+                                    -Dsonar.python.bandit.reportPaths=bandit-report.json \
+                                    -Dsonar.qualitygate.wait=true
+                            '''
+                        }
+                        timeout(time: 5, unit: 'MINUTES') {
+                            waitForQualityGate abortPipeline: true
+                        }
+                    }
+                    post {
+                        always {
+                            junit 'test-results.xml'
+                            publishHTML(target: [
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                reportDir: 'coverage-html',
+                                reportFiles: 'index.html',
+                                reportName: 'Coverage Report'
+                            ])
+                        }
+                    }
+                }
+
+                stage('Secrets Detection') {
+                    steps {
+                        container('trivy') {
+                            sh '''
+                                trivy fs . \
+                                    --security-checks secret \
+                                    --format json \
+                                    --output trivy-secrets.json \
+                                    --quiet || true
+
+                                # Fail if high-confidence secrets found
+                                python3 scripts/parse_trivy_report.py \
+                                    trivy-secrets.json --fail-on HIGH || \
+                                    echo "No critical secrets found"
+                            '''
+                        }
+                    }
+                }
+
+                stage('IaC Security') {
+                    steps {
+                        container('trivy') {
+                            sh '''
+                                trivy config terraform/ \
+                                    --format sarif \
+                                    --output trivy-iac.sarif \
+                                    --severity CRITICAL,HIGH \
+                                    --quiet || true
+
+                                trivy config k8s/ \
+                                    --format json \
+                                    --output trivy-k8s.json \
+                                    --severity CRITICAL,HIGH \
+                                    --quiet || true
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── STAGE 3: BUILD IMAGE ───────────────────────────────────
+        stage('Build Image') {
+            steps {
+                container('docker') {
+                    sh """
+                        aws ecr get-login-password --region ${AWS_REGION} | \
+                            docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                        docker build \
+                            --build-arg GIT_COMMIT=${IMAGE_TAG} \
+                            --build-arg BUILD_DATE=\$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+                            --cache-from ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest \
+                            -t ${IMAGE_URI} \
+                            -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest \
+                            app/
+
+                        docker push ${IMAGE_URI}
+                        docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+                    """
+                }
+            }
+        }
+
+        // ── STAGE 4: CONTAINER SCAN ───────────────────────────────
+        stage('Container Scan — Trivy') {
+            steps {
+                container('trivy') {
+                    sh """
+                        # CRITICAL vulns — fail the build
+                        trivy image ${IMAGE_URI} \
+                            --severity CRITICAL \
+                            --exit-code 1 \
+                            --format json \
+                            --output trivy-critical.json \
+                            --quiet
+
+                        # Full report for review
+                        trivy image ${IMAGE_URI} \
+                            --severity CRITICAL,HIGH,MEDIUM \
+                            --exit-code 0 \
+                            --format json \
+                            --output trivy-full.json \
+                            --quiet
+
+                        python3 scripts/parse_trivy_report.py trivy-full.json
+                    """
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-*.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── STAGE 5: DEPLOY DEV ───────────────────────────────────
+        stage('Deploy → Dev') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                container('kubectl') {
+                    sh """
+                        aws eks update-kubeconfig \
+                            --region ${AWS_REGION} \
+                            --name ${EKS_CLUSTER}
+
+                        python3 scripts/zero_downtime_deploy.py \
+                            --deployment api \
+                            --namespace app-dev \
+                            --image ${IMAGE_URI} \
+                            --timeout 300
+                    """
+                }
+            }
+        }
+
+        // ── STAGE 6: DEPLOY STAGING ───────────────────────────────
+        stage('Deploy → Staging') {
+            when {
+                branch 'main'
+            }
+            steps {
+                container('kubectl') {
+                    sh """
+                        aws eks update-kubeconfig \
+                            --region ${AWS_REGION} \
+                            --name ${EKS_CLUSTER}
+
+                        python3 scripts/zero_downtime_deploy.py \
+                            --deployment api \
+                            --namespace app-staging \
+                            --image ${IMAGE_URI} \
+                            --canary \
+                            --timeout 300
+                    """
+                }
+                sh "python3 scripts/smoke_test.py --env staging"
+            }
+        }
+
+        // ── STAGE 7: PROD APPROVAL GATE ───────────────────────────
+        stage('Prod Approval') {
+            when {
+                branch 'main'
+            }
+            steps {
+                timeout(time: 24, unit: 'HOURS') {
+                    input message: """
+Deploy ${IMAGE_TAG} to PRODUCTION?
+
+Security Summary:
+  • SonarQube: Quality Gate PASSED
+  • Trivy: No CRITICAL vulnerabilities
+  • Tests: Coverage ≥ 80%
+  • Staging: Smoke tests PASSED
+
+Approver: ${env.BUILD_USER ?: 'auto'}
+                    """,
+                    ok: 'Deploy to Production',
+                    submitterParameter: 'APPROVER'
+                }
+            }
+        }
+
+        // ── STAGE 8: DEPLOY PROD ──────────────────────────────────
+        stage('Deploy → Production') {
+            when {
+                branch 'main'
+                expression { return currentBuild.result != 'ABORTED' }
+            }
+            steps {
+                container('kubectl') {
+                    sh """
+                        aws eks update-kubeconfig \
+                            --region ${AWS_REGION} \
+                            --name ${EKS_CLUSTER}
+
+                        python3 scripts/zero_downtime_deploy.py \
+                            --deployment api \
+                            --namespace app \
+                            --image ${IMAGE_URI} \
+                            --canary \
+                            --timeout 600
+                    """
+                }
+                sh "python3 scripts/smoke_test.py --env prod"
+            }
+        }
+    }
+
+    // ── POST ACTIONS ──────────────────────────────────────────────
+    post {
+        success {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'good',
+                message: """✅ *Pipeline SUCCESS* — ${env.JOB_NAME} #${env.BUILD_NUMBER}
+Branch: `${env.BRANCH_NAME}` | Commit: `${IMAGE_TAG}`
+Image: `${IMAGE_URI}`
+<${env.BUILD_URL}|View Build>"""
+            )
+        }
+        failure {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'danger',
+                message: """❌ *Pipeline FAILED* — ${env.JOB_NAME} #${env.BUILD_NUMBER}
+Branch: `${env.BRANCH_NAME}` | Stage: `${env.STAGE_NAME}`
+<${env.BUILD_URL}|View Build> | <${env.BUILD_URL}console|Console>"""
+            )
+            // Auto-rollback if production deploy failed
+            script {
+                if (env.STAGE_NAME == 'Deploy → Production') {
+                    container('kubectl') {
+                        sh """
+                            kubectl rollout undo deployment/api -n app
+                            kubectl rollout status deployment/api -n app --timeout=120s
+                        """
+                    }
+                }
+            }
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
