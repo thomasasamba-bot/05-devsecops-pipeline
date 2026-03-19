@@ -33,16 +33,16 @@ concurrency:
 
 jobs:
 
-  # ──────────────────────────────────────────────────────────────────
-  # JOB 1 — CODE QUALITY & SAST (SonarQube + Pytest + Safety + Bandit)
-  # ──────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────
+  # JOB 1 — CODE QUALITY & SAST
+  # ─────────────────────────────────────────────
   code-quality:
     name: Code Quality & SAST
     runs-on: ubuntu-latest
     if: ${{ github.event.inputs.skip_scans != 'true' }}
     defaults:
       run:
-        shell: bash  # ✅ Added: ensures bash, avoids shell errors
+        shell: bash   # ✅ fail fast
 
     steps:
       - name: Checkout code
@@ -57,7 +57,7 @@ jobs:
           cache: pip
 
       - name: Upgrade pip
-        run: pip install --upgrade pip  # ✅ Fix for pip dependency issues
+        run: pip install --upgrade pip  # ✅ fix dependency issues
 
       - name: Install dependencies
         run: |
@@ -65,7 +65,7 @@ jobs:
           pip install pytest pytest-cov pytest-asyncio bandit safety
 
       - name: Set PYTHONPATH
-        run: echo "PYTHONPATH=$(pwd)" >> $GITHUB_ENV  # ✅ Fix ModuleNotFoundError for tests
+        run: echo "PYTHONPATH=$(pwd)" >> $GITHUB_ENV  # ✅ fix ModuleNotFoundError
 
       - name: Run unit tests with coverage
         run: |
@@ -83,7 +83,7 @@ jobs:
             cd terraform
             terraform init -backend=false
             terraform validate
-          fi  # ✅ Added infra validation
+          fi  # ✅ infra validation
 
       - name: Upload test results
         uses: actions/upload-artifact@v4
@@ -97,18 +97,11 @@ jobs:
 
       - name: Bandit SAST scan
         run: |
-          bandit -r app/src/ \
-            -f json \
-            -o bandit-report.json \
-            --severity-level medium \
-            --confidence-level medium
+          bandit -r app/src/ -f json -o bandit-report.json --severity-level medium --confidence-level medium
 
-      - name: Safety dependency vulnerability scan  # ✅ Updated for new CLI
+      - name: Safety dependency vulnerability scan
         run: |
-          safety scan \
-          -r app/requirements.txt \
-          --json \
-          > safety-report.json
+          safety scan -r app/requirements.txt --json --full-report --non-interactive > safety-report.json  # ✅ production-safe non-interactive
 
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@master
@@ -138,17 +131,18 @@ jobs:
           name: sast-reports
           path: |
             bandit-report.json
+            safety-report.json
 
-  # ──────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────
   # JOB 2 — BUILD & PUSH DOCKER IMAGE
-  # ──────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────
   build:
-    name: Build & Push Image
+    name: Build & Push Docker Image
     runs-on: ubuntu-latest
     needs: code-quality
     defaults:
       run:
-        shell: bash  # ✅ Added
+        shell: bash
 
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
@@ -189,10 +183,10 @@ jobs:
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
         with:
-          image:         ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          image: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
           artifact-name: sbom-${{ github.sha }}.spdx
-          output-file:   ./sbom.spdx
-          format:        spdx-json
+          output-file: ./sbom.spdx
+          format: spdx-json
 
       - name: Upload SBOM
         uses: actions/upload-artifact@v4
@@ -200,9 +194,9 @@ jobs:
           name: sbom
           path: sbom.spdx
 
-  # ──────────────────────────────────────────────────────────────────
-  # JOB 3 — CONTAINER SECURITY SCAN (Trivy)
-  # ──────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────
+  # JOB 3 — CONTAINER SECURITY SCAN
+  # ─────────────────────────────────────────────
   container-scan:
     name: Container Security Scan
     runs-on: ubuntu-latest
@@ -216,35 +210,49 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Trivy image scan (CRITICAL only - enforce policy)
+      - name: Trivy image scan (CRITICAL/HIGH)
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ needs.build.outputs.image-uri }}
-          severity: CRITICAL
-          exit-code: "1"  # ✅ Ensures production fail-on-critical
+          severity: CRITICAL,HIGH
+          exit-code: "1"   # ✅ fail pipeline if severe vulnerabilities
 
-  # ──────────────────────────────────────────────────────────────────
-  # JOB 4 — DAST (OWASP ZAP) scan
-  # ──────────────────────────────────────────────────────────────────
+      - name: Full Trivy report
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build.outputs.image-uri }}
+          format: json
+          output: trivy-full-report.json
+          exit-code: "0"
+
+      - name: Upload Trivy reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-reports
+          path: |
+            trivy-full-report.json
+
+      - name: Parse Trivy results
+        if: always()
+        run: python scripts/parse_trivy_report.py trivy-full-report.json
+
+  # ─────────────────────────────────────────────
+  # JOB 4 — DAST Scan (OWASP ZAP)
+  # ─────────────────────────────────────────────
   dast:
-    name: DAST Scan (OWASP ZAP)
+    name: DAST Scan
     runs-on: ubuntu-latest
     needs: build
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
-    defaults:
-      run:
-        shell: bash
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Start app for DAST scan
+      - name: Start app for DAST
         run: |
-          docker run -d \
-            --name app-dast \
-            -p 8080:8080 \
-            ${{ needs.build.outputs.image-uri }} || \
+          docker run -d --name app-dast -p 8080:8080 ${{ needs.build.outputs.image-uri }} || \
           docker run -d --name app-dast -p 8080:8080 nginx:alpine
           sleep 10
           curl -f http://localhost:8080/ || echo "App may not have /health endpoint"
@@ -258,6 +266,132 @@ jobs:
           fail_action: false
           artifact_name: zap-report
 
-# ──────────────────────────────────────────────────────────────────
-# Note: You can continue with deploy-dev, deploy-staging, deploy-prod here
-# using the same fixes (shell: bash, proper artifact paths, enforced failure conditions)
+  # ─────────────────────────────────────────────
+  # JOBS 5 → 7 — DEPLOY DEV → STAGING → PROD (ArgoCD)
+  # ─────────────────────────────────────────────
+  deploy-dev:
+    name: Deploy → Dev
+    runs-on: ubuntu-latest
+    needs: [container-scan]
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: dev
+      url: https://dev.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
+
+      - name: Update ArgoCD image
+        run: |
+          python scripts/update_image_tag.py \
+            --image "${{ needs.build.outputs.image-uri }}" \
+            --environment dev \
+            --commit "${{ github.sha }}"
+
+      - name: ArgoCD sync
+        run: |
+          argocd app sync demo-app-dev --server ${{ secrets.ARGOCD_SERVER }} \
+            --auth-token ${{ secrets.ARGOCD_TOKEN }} --timeout 300 --prune
+
+      - name: Wait for ArgoCD health
+        run: |
+          argocd app wait demo-app-dev --server ${{ secrets.ARGOCD_SERVER }} \
+            --auth-token ${{ secrets.ARGOCD_TOKEN }} --health --timeout 300
+
+      - name: Run smoke tests
+        run: python scripts/smoke_test.py --env dev --url https://dev.example.com
+
+  deploy-staging:
+    name: Deploy → Staging
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+      url: https://staging.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
+
+      - name: Zero-downtime deploy
+        run: |
+          python scripts/zero_downtime_deploy.py \
+            --deployment api \
+            --namespace app-staging \
+            --image "${{ needs.build.outputs.image-uri }}" \
+            --canary \
+            --timeout 300
+
+      - name: Integration tests
+        run: python scripts/integration_test.py --env staging
+
+  deploy-prod:
+    name: Deploy → Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://app.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
+
+      - name: Zero-downtime deploy
+        run: |
+          python scripts/zero_downtime_deploy.py \
+            --deployment api \
+            --namespace app \
+            --image "${{ needs.build.outputs.image-uri }}" \
+            --canary \
+            --timeout 600
+
+      - name: Run production smoke tests
+        run: python scripts/smoke_test.py --env prod --url https://app.example.com
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ Production deployment successful"
+          echo "Image: ${{ needs.build.outputs.image-uri }}"
+          echo "Commit: ${{ github.sha }}"
+
+      - name: Auto-rollback on failure
+        if: failure()
+        run: |
+          kubectl rollout undo deployment/api -n app
+          kubectl rollout status deployment/api -n app --timeout=120s
+          echo "🔄 Auto-rollback complete"
