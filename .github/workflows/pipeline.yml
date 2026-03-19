@@ -40,7 +40,7 @@ jobs:
 
     defaults:
       run:
-        shell: bash -e   # ✅ ADDED: fail fast on any command error
+        shell: bash   # ✅ ADDED: fail fast on any command error
 
     steps:
       - name: Checkout code
@@ -145,7 +145,7 @@ jobs:
 
     defaults:
       run:
-        shell: bash -e   # ✅ ADDED: fail fast
+        shell: bash   # ✅ ADDED: fail fast
 
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
@@ -190,7 +190,7 @@ jobs:
 
     defaults:
       run:
-        shell: bash -e   # ✅ ADDED
+        shell: bash  # ✅ ADDED
 
     if: ${{ github.event.inputs.skip_scans != 'true' }}
 
