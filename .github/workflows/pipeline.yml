@@ -103,11 +103,12 @@ jobs:
             --severity-level medium \
             --confidence-level medium
 
-      - name: Safety dependency vulnerability check
+      - name: Safety dependency vulnerability scan  # ✅ Updated for new CLI
         run: |
-          safety check \
-            -r app/requirements.txt \
-            --json  # ✅ Fixed invalid output flag
+          safety scan \
+          -r app/requirements.txt \
+          --json \
+          > safety-report.json
 
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@master
